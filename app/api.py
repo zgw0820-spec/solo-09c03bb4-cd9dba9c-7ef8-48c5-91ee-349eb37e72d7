@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -188,19 +189,35 @@ async def _acquire_lease(
     disconnect_task = asyncio.create_task(
         _wait_for_disconnect(request), name=f"disconnect:{model_id}"
     )
+    # Retrieve the result/error of an abandoned acquire so asyncio never warns
+    # about an unobserved exception.
+    acquire_task.add_done_callback(_consume_task_result)
 
-    async def abandon() -> None:
-        """Drop this waiter; release a lease if it won the race anyway."""
+    def abandon() -> None:
+        """Drop this waiter; release a lease if it won the race anyway.
 
-        if not acquire_task.done():
-            acquire_task.cancel()
-        try:
-            lease = await acquire_task
-        except (asyncio.CancelledError, ModelCacheError):
-            lease = None
-        if lease is not None:
-            await lease.release()
+        ``cache.acquire`` creates a lease and returns it without any await in
+        between, so a task that is not done yet when we cancel it can never
+        produce a lease afterwards.  A task that is already done is consumed
+        synchronously.  This keeps cleanup safe even when the cleanup itself
+        runs while the caller is being cancelled.
+        """
 
+        if acquire_task.done():
+            if not acquire_task.cancelled():
+                try:
+                    lease = acquire_task.result()
+                except ModelCacheError:
+                    lease = None
+                except Exception:  # noqa: BLE001 - cleanup must not mask cancel
+                    logger.exception("acquire failed while abandoning model %s", model_id)
+                    lease = None
+                else:
+                    lease.release()
+            return
+        acquire_task.cancel()
+
+    lease: ModelLease | None = None
     try:
         done, _ = await asyncio.wait(
             {acquire_task, disconnect_task},
@@ -208,20 +225,40 @@ async def _acquire_lease(
         )
         if acquire_task in done:
             # Surface cache errors even if the client also disconnected.
-            return acquire_task.result()
+            lease = acquire_task.result()
+            return lease
 
-        await abandon()
+        abandon()
         logger.info("client disconnected while waiting for model %s", model_id)
         return None
     except asyncio.CancelledError:
         # Server-side cancellation (shutdown, middleware) rather than a client
         # disconnect: same cleanup, then propagate.
-        await abandon()
+        abandon()
         raise
     finally:
         disconnect_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await disconnect_task
+        except asyncio.CancelledError:
+            # Awaiting a task we just cancelled normally raises with only the
+            # child cancelled.  If *this* task was cancelled too, a late
+            # cancellation arrived while tidying up; a lease that was already
+            # won and is about to be returned would otherwise leak, so return
+            # it and let the cancellation surface.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                if lease is not None:
+                    lease.release()
+                    lease = None
+                raise
+        except BaseException:
+            # Any other failure here would discard the pending return value,
+            # taking an already-won lease with it.
+            if lease is not None:
+                lease.release()
+                lease = None
+            raise
 
 
 def _compute(lease: ModelLease, features: np.ndarray, delay_seconds: float) -> tuple[float, bool]:
@@ -240,26 +277,139 @@ def _compute(lease: ModelLease, features: np.ndarray, delay_seconds: float) -> t
     return score, model.is_anomalous(score)
 
 
-async def _execute_inference(
-    lease: ModelLease, features: np.ndarray, delay_seconds: float
-) -> tuple[float, bool]:
-    """Run the computation and release the lease only when it is truly over.
+class _LeaseHandoff:
+    """Arbitrates ownership of a lease between the loop and a worker thread.
 
-    The release lives in this coroutine's ``finally`` rather than in the request
-    handler: a request may be cancelled (client disconnect, server shutdown)
-    while the worker thread is still scoring, and the cache must keep treating
-    the model as in use until that work ends.
+    Cancelling the future returned by ``run_in_executor`` propagates to the
+    underlying ``concurrent.futures.Future``.  If the work item has not started
+    yet, that cancel succeeds and the worker body never runs - so "the worker
+    will return the lease in its ``finally``" is not universally true.
+
+    This handshake resolves the race exactly once:
+
+    * the worker calls :meth:`try_start_worker` *before* scoring;
+    * whoever cancels/fails before the worker starts calls
+      :meth:`return_if_not_handed_off`.
+
+    Exactly one side wins the lock.  The winner owns the single
+    ``inflight`` decrement; the loser must not touch it.  ``ModelLease.release``
+    is idempotent as a second line of defence.
     """
 
+    __slots__ = ("lease", "_lock", "_handed_off", "_abandoned")
+
+    def __init__(self, lease: ModelLease) -> None:
+        self.lease = lease
+        self._lock = threading.Lock()
+        self._handed_off = False
+        self._abandoned = False
+
+    @property
+    def handed_off(self) -> bool:
+        return self._handed_off
+
+    def try_start_worker(self) -> bool:
+        """Claim the lease for this worker; ``False`` means it was abandoned."""
+
+        with self._lock:
+            if self._abandoned:
+                return False
+            self._handed_off = True
+            return True
+
+    def return_if_not_handed_off(self) -> None:
+        """Release the lease iff no worker has claimed it.
+
+        Must run on the event-loop thread (``ModelLease.release`` mutates
+        loop-owned state).
+        """
+
+        with self._lock:
+            if self._handed_off:
+                return
+            self._abandoned = True
+        self.lease.release()
+
+
+class _AbandonedInference(Exception):
+    """Raised by a worker that lost the lease handoff race."""
+
+
+def _compute_and_hand_back(
+    handoff: _LeaseHandoff,
+    features: np.ndarray,
+    delay_seconds: float,
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[float, bool]:
+    """Worker-thread body that owns the lease until the thread really ends.
+
+    The lease is returned from this function's ``finally`` - i.e. only after
+    ``_compute`` has finished - and the return is marshalled onto the loop.
+    Cancelling the awaiting coroutine therefore cannot make the cache treat the
+    model as idle while this thread is still scoring.
+    """
+
+    if not handoff.try_start_worker():
+        # The loop already returned the lease because this work item was
+        # cancelled before it started; there is nobody left to score for.
+        raise _AbandonedInference
     try:
-        return await asyncio.to_thread(_compute, lease, features, delay_seconds)
+        return _compute(handoff.lease, features, delay_seconds)
     finally:
-        await lease.release()
+        # ``ModelLease.release`` performs the decrement synchronously, so
+        # scheduling the plain method (not a coroutine) is enough.  A closed
+        # loop (interpreter shutdown) has no occupancy left to observe.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(handoff.lease.release)
 
 
-def _consume_task_result(task: asyncio.Task[Any]) -> None:
-    # A cancelled request detaches from its computation.  Retrieve any error so
-    # asyncio does not warn about an unobserved task exception.
+async def _execute_inference(
+    handoff: _LeaseHandoff, features: np.ndarray, delay_seconds: float
+) -> tuple[float, bool]:
+    """Run the computation with the worker thread holding the lease.
+
+    There is no unconditional ``finally: release`` here: cancelling the
+    executor future returns immediately while the worker thread may still be
+    scoring.  ``_compute_and_hand_back`` returns the lease when the thread
+    really ends; if the work item never starts, the cancellation path returns
+    it instead.
+    """
+
+    loop = asyncio.get_running_loop()
+    try:
+        future = loop.run_in_executor(
+            None,
+            _compute_and_hand_back,
+            handoff,
+            features,
+            delay_seconds,
+            loop,
+        )
+    except BaseException:
+        # Submission failed (e.g. the default executor is already shut down):
+        # no thread will ever run, so nobody else can return the lease.
+        handoff.return_if_not_handed_off()
+        raise
+    # If this coroutine is cancelled we stop waiting, but the executor future
+    # may still finish with an error (e.g. the worker lost the handoff race).
+    # Retrieve it so asyncio does not warn about an unobserved exception.
+    future.add_done_callback(_consume_task_result)
+    try:
+        return await future
+    except asyncio.CancelledError:
+        # If the work item never started, no worker will ever return the
+        # lease.  If it did start, the worker owns it and this is a no-op.
+        handoff.return_if_not_handed_off()
+        raise
+    except _AbandonedInference:
+        # Lost the race to the cancellation path, which already released.
+        raise asyncio.CancelledError from None
+
+
+def _consume_task_result(task: asyncio.Future[Any]) -> None:
+    # A cancelled request/computation may leave a task or executor future whose
+    # result nobody awaits.  Retrieve it so asyncio does not warn about an
+    # unobserved exception.
     if not task.cancelled():
         task.exception()
 
@@ -273,12 +423,14 @@ async def _run_inference(
     """Await scoring without letting a cancellation abort or shorten it.
 
     ``shield`` protects the computation task from the request's cancellation;
-    the task owns the lease and releases it once the thread finishes.  The task
-    is also registered in ``pending`` so the app's lifespan can wait for it.
+    the task hands the lease to a worker which releases it once the thread
+    finishes.  The task is also registered in ``pending`` so the app's lifespan
+    can wait for it.
     """
 
+    handoff = _LeaseHandoff(lease)
     task = asyncio.create_task(
-        _execute_inference(lease, features, delay_seconds),
+        _execute_inference(handoff, features, delay_seconds),
         name="inference",
     )
     pending.add(task)
@@ -286,6 +438,11 @@ async def _run_inference(
     def _done(finished: asyncio.Task[Any]) -> None:
         pending.discard(finished)
         _consume_task_result(finished)
+        # Covers a task cancelled before its coroutine ever ran *and* a work
+        # item cancelled while still queued in the executor (the worker never
+        # starts, so nobody else can return the lease).  If a worker did start,
+        # it owns the lease and this is a no-op.
+        handoff.return_if_not_handed_off()
 
     task.add_done_callback(_done)
     # Awaiting a shield means a cancellation of the request detaches from the

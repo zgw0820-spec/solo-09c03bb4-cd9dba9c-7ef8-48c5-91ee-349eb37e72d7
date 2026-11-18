@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -90,8 +90,23 @@ class CacheCounters:
 class ModelLease:
     """Exclusive-use marker for one in-flight inference.
 
-    The cache cannot evict an entry while at least one lease exists.  Releasing
-    is idempotent.
+    The cache cannot evict an entry while at least one lease exists.
+
+    ``release()`` is deliberately *not* an ``async def``.  It applies the
+    single ``inflight`` decrement immediately, on the event-loop thread, before
+    returning an awaitable.  Two interleavings matter here:
+
+    * the caller is cancelled while returning the lease - there is no await
+      point between the idempotency check and the decrement, so cancellation
+      cannot strand the occupancy;
+    * cleanup runs twice (e.g. a cancellation handler plus a shutdown sweep) -
+      the flag and decrement happen in the same uninterrupted step, so the
+      entry is decremented once and never below zero.
+
+    Not taking the cache lock is safe because every cache critical section is
+    free of suspension points, and the decrement only mutates state owned by
+    the event loop; eviction decisions in other coroutines cannot interleave
+    with this single synchronous step.  Call it from the event-loop thread.
     """
 
     __slots__ = ("_cache", "_entry", "_released")
@@ -108,11 +123,36 @@ class ModelLease:
             raise RuntimeError("lease has no loaded model")
         return model
 
-    async def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        await self._cache._release(self._entry)
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def release(self) -> Awaitable[None]:
+        """Return this lease exactly once; safe under cancellation.
+
+        The lease is returned even when the returned awaitable is never
+        awaited, which is what makes ``await lease.release()`` and a fire-and-
+        forget call from a task callback equally safe.
+        """
+
+        if not self._released:
+            self._released = True
+            self._cache._release(self._entry)
+        return _RELEASE_DONE
+
+
+class _ReleaseDone:
+    """Already-satisfied awaitable returned by :meth:`ModelLease.release`."""
+
+    __slots__ = ()
+
+    def __await__(self) -> Generator[None, None, None]:
+        if False:  # pragma: no cover - makes this a generator without yielding
+            yield None
+        return None
+
+
+_RELEASE_DONE = _ReleaseDone()
 
 
 class ModelCache:
@@ -229,7 +269,7 @@ class ModelCache:
         try:
             await event.wait()
         except asyncio.CancelledError:
-            await self._drop_waiter(entry)
+            self._drop_waiter(entry)
             raise
 
         try:
@@ -241,22 +281,26 @@ class ModelCache:
                 self._counters.hits += 1
                 return self._lease_locked(entry)
         finally:
-            await self._drop_waiter(entry)
+            self._drop_waiter(entry)
 
-    async def _drop_waiter(self, entry: _Entry) -> None:
-        async with self._lock:
-            entry.waiters = max(0, entry.waiters - 1)
+    def _drop_waiter(self, entry: _Entry) -> None:
+        # Synchronous for the same reason as ``_release``: a waiter that is
+        # cancelled must not leave a stale count behind, because a non-zero
+        # ``waiters`` permanently excludes the model from eviction.
+        entry.waiters = max(0, entry.waiters - 1)
 
     def _lease_locked(self, entry: _Entry) -> ModelLease:
         entry.inflight += 1
         entry.last_used = time.monotonic()
         return ModelLease(self, entry)
 
-    async def _release(self, entry: _Entry) -> None:
-        async with self._lock:
-            if entry.inflight > 0:
-                entry.inflight -= 1
-            entry.last_used = time.monotonic()
+    def _release(self, entry: _Entry) -> None:
+        # Synchronous and lock-free on purpose: see ``ModelLease.release``.
+        # It runs as one uninterrupted step on the event-loop thread, so it
+        # cannot be cancelled halfway or counted twice.
+        if entry.inflight > 0:
+            entry.inflight -= 1
+        entry.last_used = time.monotonic()
 
     def _start_load_locked(self, descriptor: ModelDescriptor) -> _Entry:
         required = descriptor.declared_bytes
